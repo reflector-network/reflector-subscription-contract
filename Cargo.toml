@@ -1,6 +1,6 @@
 [package]
 name = "reflector-subscriptions"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 
 [lib]
@@ -17,10 +17,10 @@ codegen-units = 1
 lto = true
 
 [dependencies]
-soroban-sdk = "21.6.0"
+soroban-sdk = "21.7.6"
 
 [dev-dependencies]
-soroban-sdk = { version = "21.6.0", features = ["testutils"] }
+soroban-sdk = { version = "21.7.6", features = ["testutils"] }
 
 [features]
 testutils = ["soroban-sdk/testutils"]
