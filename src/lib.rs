@@ -5,11 +5,13 @@ mod types;
 
 use extensions::{env_extensions::EnvExtensions, u128_extensions::U128Extensions};
 use soroban_sdk::{
-    contract, contractimpl, panic_with_error, symbol_short, token::TokenClient, Address, BytesN, Env, Symbol, Vec,
+    contract, contractimpl, panic_with_error, symbol_short, token::TokenClient, Address, BytesN,
+    Env, IntoVal, Symbol, Val, Vec,
 };
 use types::{
     contract_config::ContractConfig, error::Error, subscription::Subscription,
-    subscription_init_params::SubscriptionInitParams, subscription_status::SubscriptionStatus, ticker_asset::TickerAsset,
+    subscription_init_params::SubscriptionInitParams, subscription_status::SubscriptionStatus,
+    ticker_asset::TickerAsset,
 };
 
 const REFLECTOR: Symbol = symbol_short!("reflector");
@@ -50,6 +52,8 @@ impl SubscriptionContract {
         e.set_fee(config.fee);
         e.set_token(&config.token);
         e.set_last_subscription_id(0);
+
+        publish_updated_event(&e, &symbol_short!("config"), config);
     }
 
     // Update base Reflector subscriptions fee
@@ -65,6 +69,8 @@ impl SubscriptionContract {
     pub fn set_fee(e: Env, fee: u64) {
         e.panic_if_not_admin();
         e.set_fee(fee);
+
+        publish_updated_event(&e, &symbol_short!("fee"), fee);
     }
 
     // Publish subscription trigger event
@@ -82,7 +88,11 @@ impl SubscriptionContract {
         e.panic_if_not_admin();
         // Publish triggered event with root hash of all generated notifications
         e.events().publish(
-            (REFLECTOR, symbol_short!("triggered")),
+            (
+                REFLECTOR,
+                symbol_short!("triggers"),
+                symbol_short!("triggered"),
+            ),
             (timestamp, trigger_hash),
         );
     }
@@ -104,23 +114,33 @@ impl SubscriptionContract {
         for subscription_id in subscription_ids.iter() {
             if let Some(mut subscription) = e.get_subscription(subscription_id) {
                 // We can charge fees for several days in case if there was an interruption in background worker charge process
-                let days_charged = (now - subscription.updated) / DAY;
+                let days_charged = now
+                    .checked_sub(subscription.updated)
+                    .unwrap()
+                    .checked_div(DAY)
+                    .unwrap();
                 if days_charged == 0 {
                     continue;
                 }
-                let fee = calc_fee(e.get_fee(), &subscription.base, &subscription.quote, subscription.heartbeat);
-                let mut charge = days_charged * fee;
+                let fee = calc_fee(
+                    e.get_fee(),
+                    &subscription.base,
+                    &subscription.quote,
+                    subscription.heartbeat,
+                );
+                let mut charge = days_charged.checked_mul(fee).unwrap();
                 // Do not charge more than left on the subscription balance
                 if subscription.balance < charge {
                     charge = subscription.balance;
                 }
                 // Deduct calculated retention fees
-                subscription.balance -= charge;
+                subscription.balance = subscription.balance.checked_sub(charge).unwrap();
                 subscription.updated = now;
                 // Publish charged event
                 e.events().publish(
                     (
                         REFLECTOR,
+                        symbol_short!("triggers"),
                         symbol_short!("charged"),
                         subscription.owner.clone(),
                     ),
@@ -133,6 +153,7 @@ impl SubscriptionContract {
                     e.events().publish(
                         (
                             REFLECTOR,
+                            symbol_short!("triggers"),
                             symbol_short!("suspended"),
                             subscription.owner.clone(),
                         ),
@@ -142,7 +163,7 @@ impl SubscriptionContract {
                 // Update subscription properties
                 e.set_subscription(subscription_id, &subscription);
                 // Sum all retention fee charges
-                total_charge += charge;
+                total_charge = total_charge.checked_add(charge).unwrap();
             }
         }
         // Burn tokens charged from all subscriptions
@@ -164,7 +185,9 @@ impl SubscriptionContract {
     // Panics if the caller doesn't match admin address
     pub fn update_contract(e: Env, wasm_hash: BytesN<32>) {
         e.panic_if_not_admin();
-        e.deployer().update_current_contract_wasm(wasm_hash)
+        e.deployer().update_current_contract_wasm(wasm_hash.clone());
+
+        publish_updated_event(&e, &symbol_short!("wasm"), wasm_hash);
     }
 
     // Public
@@ -196,9 +219,14 @@ impl SubscriptionContract {
         // Check the authorization
         new_subscription.owner.require_auth();
         // Calculate daily retention fee based on subscription params
-        let retention_fee = calc_fee(e.get_fee(), &new_subscription.base, &new_subscription.quote, new_subscription.heartbeat);
+        let retention_fee = calc_fee(
+            e.get_fee(),
+            &new_subscription.base,
+            &new_subscription.quote,
+            new_subscription.heartbeat,
+        );
         // Creation fee is 2 times the daily retention fee
-        let init_fee = retention_fee * 2;
+        let init_fee = retention_fee.checked_mul(2).unwrap();
         // Check the amount
         if amount < init_fee {
             e.panic_with_error(Error::InvalidAmount);
@@ -219,7 +247,7 @@ impl SubscriptionContract {
         deposit(&e, &new_subscription.owner, amount);
         burn(&e, init_fee, amount);
         // Create subscription itself
-        let subscription_id = e.get_last_subscription_id() + 1;
+        let subscription_id = e.get_last_subscription_id().checked_add(1).unwrap();
         let subscription = Subscription {
             owner: new_subscription.owner,
             base: new_subscription.base,
@@ -227,7 +255,7 @@ impl SubscriptionContract {
             threshold: new_subscription.threshold,
             heartbeat: new_subscription.heartbeat,
             webhook: new_subscription.webhook,
-            balance: amount - init_fee,
+            balance: amount.checked_sub(init_fee).unwrap(),
             status: SubscriptionStatus::Active,
             updated: now(&e), // normalize to milliseconds
         };
@@ -235,11 +263,21 @@ impl SubscriptionContract {
         e.set_subscription(subscription_id, &subscription);
         e.set_last_subscription_id(subscription_id);
         // Extend TTL based on the subscription retention fee and balance
-        e.extend_subscription_ttl(subscription_id, calc_ledgers_to_live(&e, retention_fee, subscription.balance));
+        e.extend_subscription_ttl(
+            subscription_id,
+            calc_ledgers_to_live(&e, retention_fee, subscription.balance),
+        );
         // Publish subscription created event
         let data = (subscription_id, subscription.clone());
-        e.events()
-            .publish((REFLECTOR, symbol_short!("created"), subscription.owner), data.clone());
+        e.events().publish(
+            (
+                REFLECTOR,
+                symbol_short!("triggers"),
+                symbol_short!("created"),
+                subscription.owner,
+            ),
+            data.clone(),
+        );
         return data;
     }
 
@@ -269,17 +307,22 @@ impl SubscriptionContract {
             .get_subscription(subscription_id)
             .unwrap_or_else(|| panic_with_error!(e, Error::SubscriptionNotFound));
         // Calculate daily retention fee based on subscription params
-        let retention_fee = calc_fee(e.get_fee(), &subscription.base, &subscription.quote, subscription.heartbeat);
+        let retention_fee = calc_fee(
+            e.get_fee(),
+            &subscription.base,
+            &subscription.quote,
+            subscription.heartbeat,
+        );
         // Transfer tokens
         deposit(&e, &from, amount);
         // Update subscription balance
-        subscription.balance += amount;
+        subscription.balance = subscription.balance.checked_add(amount).unwrap();
         // Update subscription status if it was suspended
         match subscription.status {
             SubscriptionStatus::Suspended => {
                 // Burn tokens as a revival fee
                 burn(&e, retention_fee, amount);
-                subscription.balance -= retention_fee;
+                subscription.balance = subscription.balance.checked_sub(retention_fee).unwrap();
                 // Re-activate saubscription
                 subscription.status = SubscriptionStatus::Active;
             }
@@ -288,10 +331,18 @@ impl SubscriptionContract {
         // Update state
         e.set_subscription(subscription_id, &subscription);
         // Extend TTL based on the subscription retention fee and balance
-        e.extend_subscription_ttl(subscription_id, calc_ledgers_to_live(&e, retention_fee, subscription.balance));
+        e.extend_subscription_ttl(
+            subscription_id,
+            calc_ledgers_to_live(&e, retention_fee, subscription.balance),
+        );
         // Publish subscription deposited event
         e.events().publish(
-            (REFLECTOR, symbol_short!("deposited"), subscription.owner.clone()),
+            (
+                REFLECTOR,
+                symbol_short!("triggers"),
+                symbol_short!("deposited"),
+                subscription.owner.clone(),
+            ),
             (subscription_id, subscription, amount),
         );
     }
@@ -319,7 +370,8 @@ impl SubscriptionContract {
         subscription.owner.require_auth();
         match subscription.status {
             SubscriptionStatus::Active => {}
-            _ => { // Panic if the subscription is not active at the moment
+            _ => {
+                // Panic if the subscription is not active at the moment
                 e.panic_with_error(Error::InvalidSubscriptionStatusError);
             }
         }
@@ -328,8 +380,15 @@ impl SubscriptionContract {
         // Remove subscription from the state
         e.remove_subscription(subscription_id);
         // Publish subscription cancelled event
-        e.events()
-            .publish((REFLECTOR, symbol_short!("cancelled"), subscription.owner), subscription_id);
+        e.events().publish(
+            (
+                REFLECTOR,
+                symbol_short!("triggers"),
+                symbol_short!("cancelled"),
+                subscription.owner,
+            ),
+            subscription_id,
+        );
     }
 
     // Get subscription by ID
@@ -370,10 +429,16 @@ impl SubscriptionContract {
     pub fn get_retention_fee(e: Env, subscription_id: u64) -> u64 {
         panic_if_not_initialized(&e);
         // Load subscription
-        let subscription = e.get_subscription(subscription_id)
+        let subscription = e
+            .get_subscription(subscription_id)
             .unwrap_or_else(|| panic_with_error!(e, Error::SubscriptionNotFound));
         // Calculate daily retention fee based on subscription params
-        calc_fee(e.get_fee(), &subscription.base, &subscription.quote, subscription.heartbeat)
+        calc_fee(
+            e.get_fee(),
+            &subscription.base,
+            &subscription.quote,
+            subscription.heartbeat,
+        )
     }
 
     // Get the last subscription ID
@@ -446,19 +511,30 @@ impl SubscriptionContract {
     }
 }
 
-pub fn calc_fee(base_fee: u64, base_symbol: &TickerAsset, quote_symbol: &TickerAsset, heartbeat: u32) -> u64 {
+pub fn calc_fee(
+    base_fee: u64,
+    base_symbol: &TickerAsset,
+    quote_symbol: &TickerAsset,
+    heartbeat: u32,
+) -> u64 {
     let heartbeat_fee = calc_hearbeat_fee(base_fee, heartbeat);
     let complexity_factor = calc_complexity_factor(base_symbol, quote_symbol);
-    heartbeat_fee * complexity_factor
+    heartbeat_fee.checked_mul(complexity_factor).unwrap()
 }
 
 fn calc_hearbeat_fee(base_fee: u64, heartbeat: u32) -> u64 {
     //120 is reference heartbeat
-    let hearbeat_fee = (120u128 * ((base_fee as u128).pow(2)) / (heartbeat as u128)).sqrt() as u64;
-    if hearbeat_fee < base_fee { // Minimum fee is base fee
+    let hearbeat_fee = 120u128
+        .checked_mul((base_fee as u128).checked_pow(2).unwrap())
+        .unwrap()
+        .checked_div(heartbeat as u128)
+        .unwrap()
+        .sqrt() as u64;
+    if hearbeat_fee < base_fee {
+        // Minimum fee is base fee
         return base_fee;
     }
-    hearbeat_fee as u64
+    hearbeat_fee
 }
 
 fn calc_complexity_factor(base_symbol: &TickerAsset, quote_symbol: &TickerAsset) -> u64 {
@@ -500,20 +576,41 @@ fn withdraw(e: &Env, to: &Address, amount: u64) {
 
 // Get timestamp as milliseconds
 fn now(e: &Env) -> u64 {
-    e.ledger().timestamp() * 1000
+    e.ledger().timestamp().checked_mul(1000).unwrap()
 }
 
 // Calculate number of ledgers to live for subscription based on retention fee
 fn calc_ledgers_to_live(e: &Env, fee: u64, amount: u64) -> u32 {
-    let mut days: u32 = ((amount + fee - 1) / fee) as u32;
+    let mut days: u32 = amount
+        .checked_add(fee)
+        .unwrap()
+        .checked_sub(1)
+        .unwrap()
+        .checked_div(fee)
+        .unwrap() as u32;
     if days == 0 {
         days = 1;
     }
-    let ledgers = days * 17280;
+    let ledgers = days.checked_mul(17280).unwrap();
     if ledgers > e.storage().max_ttl() {
         panic_with_error!(e, Error::InvalidAmount);
     }
     ledgers
+}
+
+fn publish_updated_event<T>(e: &Env, sub_topic: &Symbol, data: T)
+where
+    T: IntoVal<Env, Val>,
+{
+    e.events().publish(
+        (
+            REFLECTOR,
+            symbol_short!("triggers"),
+            symbol_short!("updated"),
+            sub_topic,
+        ),
+        data,
+    );
 }
 
 mod test;

@@ -121,6 +121,13 @@ fn test() {
 
     let last_id = client.last_id();
     assert_eq!(last_id, 1);
+
+    client.set_fee(&(fee * 2));
+    env.as_contract(&client.address, || {
+        let current_fee = env.get_fee();
+        assert_eq!(current_fee, fee * 2);
+    });
+
 }
 
 #[test]
