@@ -381,7 +381,12 @@ impl SubscriptionContract {
         e.remove_subscription(subscription_id);
         // Publish subscription cancelled event
         e.events().publish(
-            (REFLECTOR, symbol_short!("cancelled"), subscription.owner),
+            (
+                REFLECTOR,
+                symbol_short!("triggers"),
+                symbol_short!("cancelled"),
+                subscription.owner,
+            ),
             subscription_id,
         );
     }
